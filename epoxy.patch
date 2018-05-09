@@ -1,0 +1,546 @@
+diff --git a/libs/binder/Android.bp b/libs/binder/Android.bp
+index c130087fb..44fcb69a3 100644
+--- a/libs/binder/Android.bp
++++ b/libs/binder/Android.bp
+@@ -47,6 +47,7 @@ cc_library {
+         "IAppOpsCallback.cpp",
+         "IAppOpsService.cpp",
+         "IBatteryStats.cpp",
++        "IEpoxy.cpp",
+         "IInterface.cpp",
+         "IMediaResourceMonitor.cpp",
+         "IMemory.cpp",
+diff --git a/libs/binder/Binder.cpp b/libs/binder/Binder.cpp
+index a81f44ef8..2f282b886 100644
+--- a/libs/binder/Binder.cpp
++++ b/libs/binder/Binder.cpp
+@@ -201,6 +201,11 @@ BBinder* BBinder::localBinder()
+     return this;
+ }
+ 
++void BBinder::setEpoxy(const String16& /*peer*/, const String16& /*service*/)
++{
++    ALOGW("setEpoxy called on default implementation");
++}
++
+ BBinder::~BBinder()
+ {
+     Extras* e = mExtras.load(std::memory_order_relaxed);
+diff --git a/libs/binder/BpBinder.cpp b/libs/binder/BpBinder.cpp
+index c0e029622..941b0abdb 100644
+--- a/libs/binder/BpBinder.cpp
++++ b/libs/binder/BpBinder.cpp
+@@ -18,6 +18,7 @@
+ //#define LOG_NDEBUG 0
+ 
+ #include <binder/BpBinder.h>
++#include <binder/IEpoxy.h>
+ 
+ #include <binder/IPCThreadState.h>
+ #include <binder/IResultReceiver.h>
+@@ -92,6 +93,7 @@ BpBinder::BpBinder(int32_t handle)
+     , mAlive(1)
+     , mObitsSent(0)
+     , mObituaries(NULL)
++    , isEpoxy(false)
+ {
+     ALOGV("Creating BpBinder %p handle %d\n", this, mHandle);
+ 
+@@ -160,14 +162,17 @@ status_t BpBinder::dump(int fd, const Vector<String16>& args)
+ status_t BpBinder::transact(
+     uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
+ {
++    if (isEpoxy) {
++        return eTransact(code, data, reply, flags);
++    }
++
+     // Once a binder has died, it will never come back to life.
+     if (mAlive) {
+         status_t status = IPCThreadState::self()->transact(
+-            mHandle, code, data, reply, flags);
++                mHandle, code, data, reply, flags);
+         if (status == DEAD_OBJECT) mAlive = 0;
+         return status;
+     }
+-
+     return DEAD_OBJECT;
+ }
+ 
+@@ -360,6 +365,60 @@ bool BpBinder::onIncStrongAttempted(uint32_t /*flags*/, const void* /*id*/)
+     return ipc ? ipc->attemptIncStrongHandle(mHandle) == NO_ERROR : false;
+ }
+ 
+-// ---------------------------------------------------------------------------
++
++status_t BpBinder::eTransact(
++        uint32_t eCode,
++        const Parcel& eData,
++        Parcel* eReply,
++        uint32_t eFlags)
++{
++    // Once a binder has died, it will never come back to life.
++    if (!mAlive) {
++        ALOGW("BpBinder %p handle %d is dead", this, mHandle);
++        return DEAD_OBJECT;
++    }
++    //ALOGD("BpBinder %p handle %d performing transaction on behalf of"
++            //"peer %s service %s with code %d", this, mHandle,
++            //String8(ePeer).string(), String8(eService).string(),
++            //eCode);
++
++    Parcel data;
++
++    std::vector<int8_t> vdata = std::vector<int8_t>(eData.data(),
++            eData.data() + eData.dataSize() / sizeof(*eData.data()));
++
++    data.writeInterfaceToken(String16(EPOXY_INTERFACE_DESCRIPTOR));
++
++    data.writeString16(ePeer);
++    data.writeString16(eService);
++    data.writeInt32(eCode);
++    data.writeInt32(eFlags);
++    data.writeByteVector(vdata);
++
++    // TODO: not make this copied over, abstract into doTransact()
++    status_t status = IPCThreadState::self()->transact(
++        mHandle, IEpoxy::ETRANSACT_TRANSACTION, data, eReply, 0);
++
++    //ALOGD("BpBinder %p handle %d completed transaction on behalf of"
++            //"peer %s service %s with status %d", this, mHandle,
++            //String8(ePeer).string(), String8(eService).string(),
++            //status);
++
++    if (status == DEAD_OBJECT) {
++        ALOGW("BpBinder %p handle %d died", this, mHandle);
++        mAlive = 0;
++    }
++
++    return status;
++}
++
++void BpBinder::setEpoxy(const String16& peer, const String16& service)
++{
++    ALOGD("BpBinder %p handle %d epoxy set to peer %s service %s", this,
++            mHandle, String8(peer).string(), String8(service).string());
++    ePeer = peer;
++    eService = service;
++    isEpoxy = true;
++}
+ 
+ }; // namespace android
+diff --git a/libs/binder/IEpoxy.cpp b/libs/binder/IEpoxy.cpp
+new file mode 100644
+index 000000000..adc2398f5
+--- /dev/null
++++ b/libs/binder/IEpoxy.cpp
+@@ -0,0 +1,194 @@
++
++#define LOG_TAG "EpoxyService"
++#include <utils/Log.h>
++
++#include <binder/IEpoxy.h>
++#include <binder/Parcel.h>
++
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <errno.h>
++
++
++namespace android {
++
++class BpEpoxy : public BpInterface<IEpoxy> {
++public:
++    BpEpoxy(const sp<IBinder>& impl) : BpInterface<IEpoxy>(impl) {}
++};
++
++IMPLEMENT_META_INTERFACE(Epoxy, EPOXY_INTERFACE_DESCRIPTOR);
++
++status_t BnEpoxy::eTransact(
++        const String16& peer,
++        const String16& service,
++        uint32_t eCode,
++        std::vector<int8_t>& vdata,
++        Parcel* eReply,
++        uint32_t eFlags)
++{
++    auto sock_iter = peerMap.find(peer);
++
++    if (sock_iter == peerMap.end()) {
++        ALOGI("Epoxy peer %s not encountered before. Registering...",
++                String8(peer).string());
++        auto ret = registerPeer(peer);
++        sock_iter = peerMap.find(peer);
++        if (ret != NO_ERROR || sock_iter == peerMap.end()) {
++            ALOGE("error in registering peer: %s", strerror(ret));
++            return ret;
++        }
++    }
++
++    int sock = sock_iter->second;
++
++    uint64_t len = service.size() * sizeof(*service.string());
++    uint64_t n_len = htonl(len);
++
++    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
++        ALOGE("send() service name len: %s", strerror(errno));
++        goto dead_peer;
++    }
++    if (send(sock, service.string(), len, 0) < 0) {
++        ALOGE("send() service name: %s", strerror(errno));
++        goto dead_peer;
++    }
++
++    if (send(sock, &eCode, sizeof(eCode), 0) < 0) {
++        ALOGE("send() code: %s", strerror(errno));
++        goto dead_peer;
++    }
++    if (send(sock, &eFlags, sizeof(eFlags), 0) < 0) {
++        ALOGE("send() flags: %s", strerror(errno));
++        goto dead_peer;
++    }
++
++    len = vdata.size() * sizeof(vdata[0]);
++    n_len = htonl(len);
++
++    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
++        ALOGE("send() len: %s", strerror(errno));
++        goto dead_peer;
++    }
++    if (send(sock, &vdata[0], len, 0) < 0) {
++        ALOGE("send() parcel data (len=%llu): %s", len, strerror(errno));
++        goto dead_peer;
++    }
++
++    // wait for reply
++    if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
++        ALOGE("recv() len: %s", strerror(errno));
++        goto dead_peer;
++    }
++    len = ntohl(n_len);
++    if (len == 0xffffffffffffffff) {
++        status_t err;
++        if (recv(sock, &err, sizeof(err), MSG_WAITALL) != sizeof(err)) {
++            ALOGE("recv() ret code: %s", strerror(errno));
++            goto dead_peer;
++        }
++        return err;
++    }
++
++    eReply->setDataSize(len);
++    if (recv(sock, (void *) eReply->data(), len, MSG_WAITALL) < 0) {
++        ALOGE("recv() parcel data (len=%llu): %s", len, strerror(errno));
++        goto dead_peer;
++    }
++
++    return NO_ERROR;
++
++dead_peer:
++    ALOGW("dead peer: %s. removing from peer registry",
++            String8(peer).string());
++    peerMap.erase(sock_iter);
++    return DEAD_OBJECT;
++}
++
++status_t BnEpoxy::registerPeer(const String16& peer)
++{
++    auto prv_sock = peerMap.find(peer);
++    if (prv_sock != peerMap.end()) {
++        // this should never be reached
++        ALOGE("Peer %s already exists", String8(peer).string());
++        return ALREADY_EXISTS;
++    }
++    
++    ssize_t colon_index = peer.findLast(':');
++    if (colon_index < 0 || colon_index != peer.findFirst(':')) {
++        ALOGE("Bad peer address format: %s", String8(peer).string());
++        return BAD_VALUE;
++    }
++
++    const String8 hostname = String8(peer, colon_index);
++    const String8 port = String8(peer.string() + colon_index + 1);
++
++    struct hostent* he = gethostbyname(hostname.string());
++    if (!he) {
++        ALOGE("Could not find hostname %s", hostname.string());
++        return NAME_NOT_FOUND;
++    }
++
++    char* ip = inet_ntoa(*(struct in_addr *)he->h_addr);
++    int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
++    if (sock < 0) {
++        ALOGE("Could not create socket: %s", strerror(errno));
++        return BAD_VALUE;
++    }
++
++    struct sockaddr_in servAddr;
++    memset(&servAddr, 0, sizeof(servAddr));
++    servAddr.sin_family = AF_INET;
++    servAddr.sin_addr.s_addr = inet_addr(ip);
++    servAddr.sin_port = htons(atoi(port.string()));
++
++    if (servAddr.sin_port <= 0) {
++        ALOGE("Could not interpret port %s", port.string());
++        return BAD_VALUE;
++    }
++
++    if (connect(sock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
++        ALOGE("Could not connect to hostname=%s port=%s",
++                hostname.string(), port.string());
++        return BAD_VALUE;
++    }
++    
++    //ALOGD("Connected to host %s on port %d using fd %d", hostname.string(),
++            //servAddr.sin_port, sock);
++
++    peerMap[peer] = sock;
++    return NO_ERROR;
++}
++
++status_t BnEpoxy::onTransact(
++        uint32_t code,
++        const Parcel& data,
++        Parcel* reply,
++        uint32_t flags)
++{
++    switch(code) {
++    case ETRANSACT_TRANSACTION: {
++        CHECK_INTERFACE(IEpoxy, data, reply);
++        String16 peer = data.readString16();
++        String16 service = data.readString16();
++        uint32_t eCode = data.readInt32();
++        uint32_t eFlags = data.readInt32();
++
++        std::vector<int8_t> vdata;
++        data.readByteVector(&vdata);
++
++        //ALOGD("Received ETRANSACT for service %s to %s",
++                //String8(service).string(),
++                //String8(peer).string());
++        return eTransact(peer, service, eCode, vdata, reply, eFlags);
++    } break;
++    default:
++        ALOGW("Received invalid code: %d", code);
++        return BBinder::onTransact(code, data, reply, flags);
++    }
++}
++
++}; // namespace android
+diff --git a/libs/binder/IServiceManager.cpp b/libs/binder/IServiceManager.cpp
+index c7a0f43a9..8c74f80d7 100644
+--- a/libs/binder/IServiceManager.cpp
++++ b/libs/binder/IServiceManager.cpp
+@@ -17,6 +17,7 @@
+ #define LOG_TAG "ServiceManager"
+ 
+ #include <binder/IServiceManager.h>
++#include <binder/IEpoxy.h>
+ 
+ #include <utils/Log.h>
+ #include <binder/IPCThreadState.h>
+@@ -134,6 +135,18 @@ public:
+ 
+     virtual sp<IBinder> getService(const String16& name) const
+     {
++        ssize_t at_index = name.findLast('@');
++        if (at_index >= 0) {
++            if (at_index != name.findFirst('@')) {
++                ALOGE("Invalid service name format: %s",
++                        String8(name).string());
++                return NULL;
++            }
++            const String16 service = String16(name, at_index);
++            const String16 peer = String16(name.string() + at_index + 1);
++            return getEService(peer, service);
++        }
++
+         unsigned n;
+         for (n = 0; n < 5; n++){
+             if (n > 0) {
+@@ -151,6 +164,29 @@ public:
+         return NULL;
+     }
+ 
++    virtual sp<IBinder> getEService(const String16& peer, const String16& service) const
++    {
++        ssize_t colon_index = peer.findLast(':');
++        if (colon_index < 0 || colon_index != peer.findFirst(':')) {
++            ALOGE("Invalid peer format: %s", String8(peer).string());
++            return NULL;
++        }
++
++        // get Epoxy service
++        sp<IBinder> binder = getService(String16(EPOXY_SERVICE_NAME));
++        if (binder != NULL) {
++            binder->setEpoxy(peer, service);
++            //ALOGD("Making epoxy service %s with peer %s",
++                    //EPOXY_SERVICE_NAME, String8(peer).string());
++        } else {
++            ALOGE("Could not get epoxy service %s for peer %s",
++                    EPOXY_SERVICE_NAME, String8(peer).string());
++            return NULL;
++        }
++
++        return binder;
++    }
++
+     virtual sp<IBinder> checkService( const String16& name) const
+     {
+         Parcel data, reply;
+diff --git a/libs/binder/include/binder/Binder.h b/libs/binder/include/binder/Binder.h
+index 34048816c..7c9929d08 100644
+--- a/libs/binder/include/binder/Binder.h
++++ b/libs/binder/include/binder/Binder.h
+@@ -57,6 +57,9 @@ public:
+ 
+     virtual BBinder*    localBinder();
+ 
++    virtual void        setEpoxy(   const String16& peer,
++                                    const String16& service);
++
+ protected:
+     virtual             ~BBinder();
+ 
+diff --git a/libs/binder/include/binder/BpBinder.h b/libs/binder/include/binder/BpBinder.h
+index 7ef93aa39..e28625fc7 100644
+--- a/libs/binder/include/binder/BpBinder.h
++++ b/libs/binder/include/binder/BpBinder.h
+@@ -61,6 +61,14 @@ public:
+             status_t    setConstantData(const void* data, size_t size);
+             void        sendObituary();
+ 
++            void        setEpoxy(   const String16& peer,
++                                    const String16& service);
++
++            status_t    eTransact(  uint32_t eCode,
++                                    const Parcel& eData,
++                                    Parcel* eReply,
++                                    uint32_t eFlags);
++
+     class ObjectManager
+     {
+     public:
+@@ -115,6 +123,10 @@ private:
+             ObjectManager       mObjects;
+             Parcel*             mConstantData;
+     mutable String16            mDescriptorCache;
++
++            String16            ePeer;
++            String16            eService;
++            bool                isEpoxy;
+ };
+ 
+ }; // namespace android
+diff --git a/libs/binder/include/binder/IBinder.h b/libs/binder/include/binder/IBinder.h
+index 2e6295787..addf00f31 100644
+--- a/libs/binder/include/binder/IBinder.h
++++ b/libs/binder/include/binder/IBinder.h
+@@ -91,6 +91,9 @@ public:
+                                         Parcel* reply,
+                                         uint32_t flags = 0) = 0;
+ 
++    virtual void            setEpoxy(   const String16& peer,
++                                        const String16& service) = 0;
++
+     // DeathRecipient is pure abstract, there is no virtual method
+     // implementation to put in a translation unit in order to silence the
+     // weak vtables warning.
+diff --git a/libs/binder/include/binder/IEpoxy.h b/libs/binder/include/binder/IEpoxy.h
+new file mode 100644
+index 000000000..8b9025b56
+--- /dev/null
++++ b/libs/binder/include/binder/IEpoxy.h
+@@ -0,0 +1,91 @@
++#ifndef ANDROID_IEPOXY_H
++#define ANDROID_IEPOXY_H
++
++#include <binder/IInterface.h>
++#include <binder/BpBinder.h>
++#include <binder/Parcel.h>
++
++#define EPOXY_PORT 6118
++#define EPOXY_SERVICE_NAME "epoxy"
++#define EPOXY_INTERFACE_DESCRIPTOR "columbia.epoxy.IEpoxy"
++
++namespace android {
++
++class IEpoxy : public IInterface
++{
++public:
++    DECLARE_META_INTERFACE(Epoxy)
++
++        /*
++    virtual status_t    eTransact( const String16& peer,
++                                   const String16& service,
++                                   uint32_t eCode,
++                                   const Parcel& eData,
++                                   Parcel *eReply,
++                                   uint32_t eFlags = 0) = 0;
++
++    virtual status_t    registerPeer(const String16& peer) = 0;
++    */
++
++    enum {
++        ETRANSACT_TRANSACTION = IBinder::FIRST_CALL_TRANSACTION,
++        //REGISTER_PEER_TRANSACTION,
++    };
++};
++
++
++class BnEpoxy : public BnInterface<IEpoxy>
++{
++    std::map<String16, int> peerMap;
++public:
++    virtual status_t    onTransact( uint32_t code,
++                                    const Parcel& data,
++                                    Parcel* reply,
++                                    uint32_t flags = 0);
++
++    virtual status_t    eTransact( const String16& ePeer,
++                                   const String16& eService,
++                                   uint32_t eCode,
++                                   std::vector<int8_t>& vdata,
++                                   Parcel *eReply,
++                                   uint32_t eFlags = 0);
++
++    virtual status_t    registerPeer( const String16& peer );
++};
++
++/*
++class BpEpoxy : public BpBinder, public BpInterface<IEpoxy> {
++public:
++    BpEpoxy(const sp<IBinder>& impl);
++    virtual status_t    eTransact( const String16& ePeer,
++                                   const String16& eService,
++                                   uint32_t eCode,
++                                   const Parcel& eData,
++                                   Parcel *eReply,
++                                   uint32_t eFlags = 0);
++
++    virtual status_t    registerPeer(const String16& peer);
++};
++*/
++
++/*
++template<typename INTERFACE>
++class EpInterface : public IBinder, INTERFACE {
++public:
++    EpInterface(sp<BpEpoxy>& epoxy, const String16& ePeer,
++            const String16& eService)
++        : bp(epoxy), peer(ePeer), service(eService) {}
++
++    status_t transact(uint32_t code, const Parcel& data, Parcel *reply,
++            uint32_t flags = 0)
++    { return bp.eTransact(peer, service, code, data, reply, flags); }
++
++private:
++    BpEpoxy bp;
++    String16 peer, service;
++};
++*/
++
++}; // namespace android
++
++#endif // ANDROID_IEPOXY_H
