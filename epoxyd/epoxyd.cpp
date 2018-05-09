@@ -22,25 +22,37 @@
 using namespace android;
 using namespace std;
 
+#if 0
+#include <chrono>
+#define DEF_TIMER(t) auto t = std::chrono::high_resolution_clock::now()
+#define ALOGT(t) ALOGD("TIME " #t ": %lf", \
+        std::chrono::duration<double, std::micro> \
+        (std::chrono::high_resolution_clock::now() - t).count())
+#else
+#define DEF_TIMER(t)
+#define ALOGT(t)
+#endif
+
 void* handleConn(void* arg)
 {
     int sock = (long) arg;
+    status_t err;
 
-    ALOGI("Handler started on fd %d", sock);
-
-    for (;;) {
+    DEF_TIMER(handler_time);
+    {
+        DEF_TIMER(recv_time);
         uint64_t n_len;
-        status_t err;
-
         if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
-            goto quit;
+            ALOGE("recv() service name name: %s", strerror(errno));
+            goto out;
         }
 
         uint64_t len = ntohl(n_len);
 
         char *service_buf[len];
         if (recv(sock, service_buf, len, MSG_WAITALL) < 0) {
-            goto quit;
+            ALOGE("recv() service name: %s", strerror(errno));
+            goto out;
         }
 
         String16 service = String16((const char16_t*)service_buf,
@@ -48,38 +60,44 @@ void* handleConn(void* arg)
         
         uint32_t code, flags;
         if (recv(sock, &code, sizeof(code), MSG_WAITALL) != sizeof(code)) {
-            goto quit;
+            ALOGE("recv() code: %s", strerror(errno));
+            goto out;
         }
         if (recv(sock, &flags, sizeof(flags), MSG_WAITALL) != sizeof(flags)) {
-            goto quit;
+            ALOGE("recv() flags: %s", strerror(errno));
+            goto out;
         }
         if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
-            goto quit;
+            ALOGE("recv() parcel len: %s", strerror(errno));
+            goto out;
         }
-        len = ntohl(n_len);
 
-        //ALOGD("Handler on fd %d receiving data of length %llu (net: %llu)",
-                //sock, len, n_len);
+        len = ntohl(n_len);
 
         Parcel data;
         data.setDataSize(len);
         if (recv(sock, (void*) data.data(), len, MSG_WAITALL) < 0) {
-            goto quit;
+            ALOGE("recv() parcel data: %s", strerror(errno));
+            goto out;
         }
 
-        Parcel reply;
+        ALOGT(recv_time);
+
+        DEF_TIMER(binder_time);
 
         sp < IServiceManager > sm = defaultServiceManager();
         sp < IBinder > binder = sm->getService(service);
 
         if (!binder) {
-            ALOGW("fd %d: service %s not found",
-                    sock, String8(service).string());
+            ALOGW("fd %d: service %s not found", sock, String8(service).string());
             err = NAME_NOT_FOUND;
             goto send_err;
         }
 
+        Parcel reply;
         err = binder->transact(code, data, &reply);
+        ALOGT(binder_time);
+
         if (err != NO_ERROR) {
             ALOGW("fd %d: transact failed: %s", sock, strerror(err));
             goto send_err;
@@ -88,30 +106,37 @@ void* handleConn(void* arg)
         len = reply.dataSize() * sizeof(*reply.data());
         n_len = htonl(len);
 
+        DEF_TIMER(send_time);
         if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
-            goto quit;
+            ALOGE("send() len: %s", strerror(errno));
+            goto out;
         }
         if (send(sock, reply.data(), len, 0) < 0) {
-            goto quit;
+            ALOGE("send() data: %s", strerror(errno));
+            goto out;
         }
 
-        continue;
+        ALOGT(send_time);
+        goto out;
+    }
 
-    send_err:
-        len = 0xffffffffffffffff;
-        n_len = htonl(len);
+send_err: {
+        uint64_t len = 0xffffffffffffffff;
+        uint64_t n_len = htonl(len);        // this should be a nop, unnecessary
+
         if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
-            goto quit;
+            ALOGE("send() error len: %s", strerror(errno));
+            goto out;
         }
         if (send(sock, &err, sizeof(err), 0) < 0) {
-            goto quit;
+            ALOGE("send() error: %s", strerror(errno));
+            goto out;
         }
     }
 
-quit:
-    ALOGE("invalid send/recv: %s", strerror(errno));
-    ALOGW("quitting handler fd: %d", sock);
+out:
     close(sock);
+    ALOGT(handler_time);
     pthread_exit(NULL);
 }
 

@@ -130,10 +130,10 @@ index c0e029622..941b0abdb 100644
  }; // namespace android
 diff --git a/libs/binder/IEpoxy.cpp b/libs/binder/IEpoxy.cpp
 new file mode 100644
-index 000000000..adc2398f5
+index 000000000..595c07ccf
 --- /dev/null
 +++ b/libs/binder/IEpoxy.cpp
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,197 @@
 +
 +#define LOG_TAG "EpoxyService"
 +#include <utils/Log.h>
@@ -148,6 +148,16 @@ index 000000000..adc2398f5
 +#include <netdb.h>
 +#include <errno.h>
 +
++#if 0
++#include <chrono>
++#define DEF_TIMER(t) auto t = std::chrono::high_resolution_clock::now()
++#define ALOGT(t) ALOGD("TIME " #t ": %lf", \
++        std::chrono::duration<double, std::micro> \
++        (std::chrono::high_resolution_clock::now() - t).count())
++#else
++#define DEF_TIMER(t)
++#define ALOGT(t)
++#endif
 +
 +namespace android {
 +
@@ -166,93 +176,8 @@ index 000000000..adc2398f5
 +        Parcel* eReply,
 +        uint32_t eFlags)
 +{
-+    auto sock_iter = peerMap.find(peer);
-+
-+    if (sock_iter == peerMap.end()) {
-+        ALOGI("Epoxy peer %s not encountered before. Registering...",
-+                String8(peer).string());
-+        auto ret = registerPeer(peer);
-+        sock_iter = peerMap.find(peer);
-+        if (ret != NO_ERROR || sock_iter == peerMap.end()) {
-+            ALOGE("error in registering peer: %s", strerror(ret));
-+            return ret;
-+        }
-+    }
-+
-+    int sock = sock_iter->second;
-+
-+    uint64_t len = service.size() * sizeof(*service.string());
-+    uint64_t n_len = htonl(len);
-+
-+    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
-+        ALOGE("send() service name len: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+    if (send(sock, service.string(), len, 0) < 0) {
-+        ALOGE("send() service name: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+
-+    if (send(sock, &eCode, sizeof(eCode), 0) < 0) {
-+        ALOGE("send() code: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+    if (send(sock, &eFlags, sizeof(eFlags), 0) < 0) {
-+        ALOGE("send() flags: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+
-+    len = vdata.size() * sizeof(vdata[0]);
-+    n_len = htonl(len);
-+
-+    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
-+        ALOGE("send() len: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+    if (send(sock, &vdata[0], len, 0) < 0) {
-+        ALOGE("send() parcel data (len=%llu): %s", len, strerror(errno));
-+        goto dead_peer;
-+    }
-+
-+    // wait for reply
-+    if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
-+        ALOGE("recv() len: %s", strerror(errno));
-+        goto dead_peer;
-+    }
-+    len = ntohl(n_len);
-+    if (len == 0xffffffffffffffff) {
-+        status_t err;
-+        if (recv(sock, &err, sizeof(err), MSG_WAITALL) != sizeof(err)) {
-+            ALOGE("recv() ret code: %s", strerror(errno));
-+            goto dead_peer;
-+        }
-+        return err;
-+    }
-+
-+    eReply->setDataSize(len);
-+    if (recv(sock, (void *) eReply->data(), len, MSG_WAITALL) < 0) {
-+        ALOGE("recv() parcel data (len=%llu): %s", len, strerror(errno));
-+        goto dead_peer;
-+    }
-+
-+    return NO_ERROR;
-+
-+dead_peer:
-+    ALOGW("dead peer: %s. removing from peer registry",
-+            String8(peer).string());
-+    peerMap.erase(sock_iter);
-+    return DEAD_OBJECT;
-+}
-+
-+status_t BnEpoxy::registerPeer(const String16& peer)
-+{
-+    auto prv_sock = peerMap.find(peer);
-+    if (prv_sock != peerMap.end()) {
-+        // this should never be reached
-+        ALOGE("Peer %s already exists", String8(peer).string());
-+        return ALREADY_EXISTS;
-+    }
-+    
++    DEF_TIMER(transact_time);
++    DEF_TIMER(connect_time);
 +    ssize_t colon_index = peer.findLast(':');
 +    if (colon_index < 0 || colon_index != peer.findFirst(':')) {
 +        ALOGE("Bad peer address format: %s", String8(peer).string());
@@ -261,7 +186,6 @@ index 000000000..adc2398f5
 +
 +    const String8 hostname = String8(peer, colon_index);
 +    const String8 port = String8(peer.string() + colon_index + 1);
-+
 +    struct hostent* he = gethostbyname(hostname.string());
 +    if (!he) {
 +        ALOGE("Could not find hostname %s", hostname.string());
@@ -275,28 +199,107 @@ index 000000000..adc2398f5
 +        return BAD_VALUE;
 +    }
 +
-+    struct sockaddr_in servAddr;
-+    memset(&servAddr, 0, sizeof(servAddr));
-+    servAddr.sin_family = AF_INET;
-+    servAddr.sin_addr.s_addr = inet_addr(ip);
-+    servAddr.sin_port = htons(atoi(port.string()));
++    status_t err = UNKNOWN_ERROR;
++    { // from this point onwards, we need to close the socket() before exiting
++        struct sockaddr_in servAddr;
++        memset(&servAddr, 0, sizeof(servAddr));
++        servAddr.sin_family = AF_INET;
++        servAddr.sin_addr.s_addr = inet_addr(ip);
++        servAddr.sin_port = htons(atoi(port.string()));
 +
-+    if (servAddr.sin_port <= 0) {
-+        ALOGE("Could not interpret port %s", port.string());
-+        return BAD_VALUE;
++        if (servAddr.sin_port <= 0) {
++            ALOGE("Could not interpret port %s", port.string());
++            err = BAD_VALUE;
++            goto close_out;
++        }
++
++        if (connect(sock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
++            ALOGE("Could not connect to hostname=%s port=%s",
++                    hostname.string(), port.string());
++            err = BAD_VALUE;
++            goto close_out;
++        }
++
++        ALOGT(connect_time);
++
++        uint64_t len = service.size() * sizeof(*service.string());
++        uint64_t n_len = htonl(len);
++
++        DEF_TIMER(send_time);
++
++        if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
++            ALOGE("send() service name len: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++
++        if (send(sock, service.string(), len, 0) < 0) {
++            ALOGE("send() service name: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++
++        if (send(sock, &eCode, sizeof(eCode), 0) < 0) {
++            ALOGE("send() code: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++        if (send(sock, &eFlags, sizeof(eFlags), 0) < 0) {
++            ALOGE("send() flags: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++
++        len = vdata.size() * sizeof(vdata[0]);
++        n_len = htonl(len);
++
++        if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
++            ALOGE("send() len: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++        if (send(sock, &vdata[0], len, 0) < 0) {
++            ALOGE("send() parcel data (len=%llu): %s", len, strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++
++        ALOGT(send_time);
++
++        DEF_TIMER(recv_time);
++        // wait for reply
++        if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
++            ALOGE("recv() len: %s", strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++        len = ntohl(n_len);
++        if (len == 0xffffffffffffffff) {
++            status_t err;
++            if (recv(sock, &err, sizeof(err), MSG_WAITALL) != sizeof(err)) {
++                ALOGE("recv() ret code: %s", strerror(errno));
++                err = DEAD_OBJECT;
++                goto close_out;
++            }
++            return err;
++        }
++
++        eReply->setDataSize(len);
++        if (recv(sock, (void *) eReply->data(), len, MSG_WAITALL) < 0) {
++            ALOGE("recv() parcel data (len=%llu): %s", len, strerror(errno));
++            err = DEAD_OBJECT;
++            goto close_out;
++        }
++
++        ALOGT(recv_time);
++
++        err = NO_ERROR;
 +    }
 +
-+    if (connect(sock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
-+        ALOGE("Could not connect to hostname=%s port=%s",
-+                hostname.string(), port.string());
-+        return BAD_VALUE;
-+    }
-+    
-+    //ALOGD("Connected to host %s on port %d using fd %d", hostname.string(),
-+            //servAddr.sin_port, sock);
-+
-+    peerMap[peer] = sock;
-+    return NO_ERROR;
++close_out:
++    close(sock);
++    ALOGT(transact_time);
++    return err;
 +}
 +
 +status_t BnEpoxy::onTransact(
@@ -449,10 +452,10 @@ index 2e6295787..addf00f31 100644
      // weak vtables warning.
 diff --git a/libs/binder/include/binder/IEpoxy.h b/libs/binder/include/binder/IEpoxy.h
 new file mode 100644
-index 000000000..8b9025b56
+index 000000000..90cdb64d8
 --- /dev/null
 +++ b/libs/binder/include/binder/IEpoxy.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,43 @@
 +#ifndef ANDROID_IEPOXY_H
 +#define ANDROID_IEPOXY_H
 +
@@ -471,27 +474,14 @@ index 000000000..8b9025b56
 +public:
 +    DECLARE_META_INTERFACE(Epoxy)
 +
-+        /*
-+    virtual status_t    eTransact( const String16& peer,
-+                                   const String16& service,
-+                                   uint32_t eCode,
-+                                   const Parcel& eData,
-+                                   Parcel *eReply,
-+                                   uint32_t eFlags = 0) = 0;
-+
-+    virtual status_t    registerPeer(const String16& peer) = 0;
-+    */
-+
 +    enum {
 +        ETRANSACT_TRANSACTION = IBinder::FIRST_CALL_TRANSACTION,
-+        //REGISTER_PEER_TRANSACTION,
 +    };
 +};
 +
 +
 +class BnEpoxy : public BnInterface<IEpoxy>
 +{
-+    std::map<String16, int> peerMap;
 +public:
 +    virtual status_t    onTransact( uint32_t code,
 +                                    const Parcel& data,
@@ -504,42 +494,7 @@ index 000000000..8b9025b56
 +                                   std::vector<int8_t>& vdata,
 +                                   Parcel *eReply,
 +                                   uint32_t eFlags = 0);
-+
-+    virtual status_t    registerPeer( const String16& peer );
 +};
-+
-+/*
-+class BpEpoxy : public BpBinder, public BpInterface<IEpoxy> {
-+public:
-+    BpEpoxy(const sp<IBinder>& impl);
-+    virtual status_t    eTransact( const String16& ePeer,
-+                                   const String16& eService,
-+                                   uint32_t eCode,
-+                                   const Parcel& eData,
-+                                   Parcel *eReply,
-+                                   uint32_t eFlags = 0);
-+
-+    virtual status_t    registerPeer(const String16& peer);
-+};
-+*/
-+
-+/*
-+template<typename INTERFACE>
-+class EpInterface : public IBinder, INTERFACE {
-+public:
-+    EpInterface(sp<BpEpoxy>& epoxy, const String16& ePeer,
-+            const String16& eService)
-+        : bp(epoxy), peer(ePeer), service(eService) {}
-+
-+    status_t transact(uint32_t code, const Parcel& data, Parcel *reply,
-+            uint32_t flags = 0)
-+    { return bp.eTransact(peer, service, code, data, reply, flags); }
-+
-+private:
-+    BpEpoxy bp;
-+    String16 peer, service;
-+};
-+*/
 +
 +}; // namespace android
 +
