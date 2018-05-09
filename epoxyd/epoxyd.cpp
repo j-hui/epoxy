@@ -22,82 +22,112 @@
 using namespace android;
 using namespace std;
 
-void *handleConn(void *arg)
+void* handleConn(void* arg)
 {
     int sock = (long) arg;
 
-    ALOGD("Handling connection on fd %d", sock);
+    ALOGI("Handler started on fd %d", sock);
 
     for (;;) {
-        size_t len, n_len;
+        uint64_t n_len;
+        status_t err;
 
-        ALOGD("Handler on fd %d waiting on recv()...", sock);
-        recv(sock, &n_len, sizeof(n_len), MSG_WAITALL);
-        len = ntohl(n_len);
+        if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
+            goto quit;
+        }
+
+        uint64_t len = ntohl(n_len);
 
         char *service_buf[len];
-        recv(sock, service_buf, sizeof(service_buf), MSG_WAITALL);
+        if (recv(sock, service_buf, len, MSG_WAITALL) < 0) {
+            goto quit;
+        }
 
-        String16 service = String16((const char*)service_buf, len);
-
+        String16 service = String16((const char16_t*)service_buf,
+                len / sizeof(char16_t));
         
         uint32_t code, flags;
-        recv(sock, &code, sizeof(code), MSG_WAITALL);
-        recv(sock, &flags, sizeof(flags), MSG_WAITALL);
-
-        ALOGD("Handler on fd %d received request for service %s with code %d",
-                sock, String8(service).string(), code);
-        
-        recv(sock, &n_len, sizeof(n_len), MSG_WAITALL);
+        if (recv(sock, &code, sizeof(code), MSG_WAITALL) != sizeof(code)) {
+            goto quit;
+        }
+        if (recv(sock, &flags, sizeof(flags), MSG_WAITALL) != sizeof(flags)) {
+            goto quit;
+        }
+        if (recv(sock, &n_len, sizeof(n_len), MSG_WAITALL) != sizeof(n_len)) {
+            goto quit;
+        }
         len = ntohl(n_len);
 
-        ALOGD("Handler on fd %d receiving data of length %d", sock, len);
+        //ALOGD("Handler on fd %d receiving data of length %llu (net: %llu)",
+                //sock, len, n_len);
 
         Parcel data;
         data.setDataSize(len);
-        recv(sock, (void *) data.data(), len, MSG_WAITALL);
+        if (recv(sock, (void*) data.data(), len, MSG_WAITALL) < 0) {
+            goto quit;
+        }
 
         Parcel reply;
 
         sp < IServiceManager > sm = defaultServiceManager();
         sp < IBinder > binder = sm->getService(service);
 
-        status_t status = binder->transact(code, data, &reply);
+        if (!binder) {
+            ALOGW("fd %d: service %s not found",
+                    sock, String8(service).string());
+            err = NAME_NOT_FOUND;
+            goto send_err;
+        }
 
-        if (status == NO_ERROR) {
-            ALOGD("Handler on fd %d: transact succeeded", sock);
-        } else {
-            ALOGD("Handler on fd %d: transact failed: %s", sock, strerror(status));
+        err = binder->transact(code, data, &reply);
+        if (err != NO_ERROR) {
+            ALOGW("fd %d: transact failed: %s", sock, strerror(status));
+            goto send_err;
         }
 
         len = reply.dataSize() * sizeof(*reply.data());
         n_len = htonl(len);
 
-        send(sock, &n_len, sizeof(n_len), 0);
-        send(sock, reply.data(), len, 0);
-        ALOGD("Handler on fd %d finished serving epoxy transaction", sock);
+        if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
+            goto quit;
+        }
+        if (send(sock, reply.data(), len, 0) < 0) {
+            goto quit;
+        }
     }
 
-    // never reached
+send_err:
+    len = 0xffffffffffffffff;
+    n_len = htonl(len);
+    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
+        goto quit;
+    }
+    if (send(sock, &err, sizeof(err), 0) < 0) {
+        goto quit;
+    }
+    continue;
+quit:
+    ALOGE("invalid send/recv: %s", strerror(errno));
+    ALOGW("quitting handler fd: %d", sock);
     close(sock);
     pthread_exit(NULL);
 }
 
 int runServer(unsigned short port) {
-    int servSock, clntSock;
-    struct sockaddr_in servAddr, clntAddr;
-
-    if ((servSock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+    int servSock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (servSock < 0) {
         ALOGE("Could not create listening socket: %s", strerror(errno));
         return 1;
     }
 
+    struct sockaddr_in servAddr;
     memset(&servAddr, 0, sizeof(servAddr));
     servAddr.sin_family = AF_INET;
     servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servAddr.sin_port = htons(port);
-    if (bind(servSock, (struct sockaddr *) &servAddr, sizeof(servAddr)) < 0) {
-        ALOGE("Could not bind to socket on port %d: %s", port, strerror(errno));
+
+    if (::bind(servSock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
+        ALOGE("Could not bind socket on port %d: %s", port, strerror(errno));
         return 1;
     }
 
@@ -110,13 +140,13 @@ int runServer(unsigned short port) {
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    ALOGD("epoxyd server created on port %d fd %d", port, servSock);
-
     for (;;) {
+        struct sockaddr_in clntAddr;
         socklen_t clntLen = sizeof(clntAddr);
-        if((clntSock = accept(servSock, (struct sockaddr *) &clntAddr,
-                        &clntLen)) < 0) {
+        int clntSock = accept(servSock, (struct sockaddr*)&clntAddr, &clntLen);
+        if (clntSock < 0) {
             ALOGE("Accept failed: %s", strerror(errno));
+            continue;
         }
 
         char *clntIP = inet_ntoa(clntAddr.sin_addr);
@@ -124,10 +154,11 @@ int runServer(unsigned short port) {
         ALOGI("Accepted connection from %s on fd %d", clntIP, clntSock);
         
         pthread_t t;
-        int err;
-        err = pthread_create(&t, &attr, handleConn, (void *) (long) clntSock);
-        if (err)
+        int err = pthread_create(&t, &attr, handleConn,
+                (void*) (long) clntSock);
+        if (err) {
             ALOGE("pthread_create error: %s", strerror(errno));
+        }
     }
     // never reached
 }

@@ -9,12 +9,15 @@
 using namespace std;
 using namespace android;
 
-int main(void)
+int main(int argc, char** argv)
 {
-    cerr << "Starting echo service..." << endl; 
+    String16 suffix{};
+    if (argc > 1) {
+        suffix = String16(argv[1]);
+    }
 
     sp<IServiceManager> sm = defaultServiceManager();
-    sm->addService(ECHO_SERVICE_NAME16, new BnEchoService());
+    sm->addService(ECHO_SERVICE_NAME16, new BnEchoService(suffix));
     cerr << "Added service " << ECHO_SERVICE_NAME << endl;
 
     cerr << "Joining ProcessState ThreadPool" << endl;

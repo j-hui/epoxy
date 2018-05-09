@@ -15,17 +15,25 @@ int main(int argc, char **argv)
         cerr << "usage: " << *argv << " <msg> [<host> <port>]" << endl;
         return 1;
     }
-    
+
     String16 msg = String16(argv[1]);
     String16 service = ECHO_SERVICE_NAME16;
 
     if (argc == 4)
-        service += "@" += argv[2] += ":" argv[3];
+        service += String16("@")
+                + String16(argv[2])
+                + String16(":")
+                + String16(argv[3]);
 
     cerr << "EchoClient to connect with " << String8(service).string() << endl;
 
     sp<IServiceManager> sm = defaultServiceManager();
-    sp<IBinder> binder = sm->getService(ECHO_SERVICE_NAME16);
+    sp<IBinder> binder = sm->getService(service);
+
+    if (!binder) {
+        cerr << "could not retrieve binder. exiting." << endl;
+        return 22;
+    }
 
     sp<IEchoService> es = interface_cast<IEchoService>(binder);
 

@@ -4,7 +4,8 @@ include $(CLEAR_VARS)
 LOCAL_SHARED_LIBRARIES := \
     libcutils \
     libutils \
-    libbinder       
+    libbinder \
+	liblog
 
 LOCAL_MODULE    := EchoService
 LOCAL_SRC_FILES := \
