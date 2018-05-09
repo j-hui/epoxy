@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <iostream>
+#include <chrono>
 
 using namespace std;
 using namespace android;
@@ -28,19 +29,31 @@ int main(int argc, char **argv)
     cerr << "EchoClient to connect with " << String8(service).string() << endl;
 
     sp<IServiceManager> sm = defaultServiceManager();
+
+    auto get_b = chrono::high_resolution_clock::now();
     sp<IBinder> binder = sm->getService(service);
+    auto get_e = chrono::high_resolution_clock::now();
 
     if (!binder) {
         cerr << "could not retrieve binder. exiting." << endl;
-        return 22;
+        return 2;
     }
 
     sp<IEchoService> es = interface_cast<IEchoService>(binder);
 
     cerr << "Echoclient sending message: " << String8(msg).string() << endl;
-    String16 reply = es->echo(msg);
 
-    cout << "Echoclient received reply: " << String8(reply).c_str() << endl;
+    auto call_b = chrono::high_resolution_clock::now();
+    String16 reply = es->echo(msg);
+    auto call_e = chrono::high_resolution_clock::now();
+
+    cerr << "Echoclient received reply: " << String8(reply).c_str() << endl;
+
+    auto get_t = chrono::duration<double, micro>(get_e - get_b).count();
+    auto call_t = chrono::duration<double, micro>(call_e - call_b).count();
+
+    cout << "retrieving service: " << get_t << endl;
+    cout << "performing RPC call: " << call_t << endl;
 
     return 0;
 }
