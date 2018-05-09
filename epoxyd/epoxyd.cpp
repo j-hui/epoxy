@@ -81,7 +81,7 @@ void* handleConn(void* arg)
 
         err = binder->transact(code, data, &reply);
         if (err != NO_ERROR) {
-            ALOGW("fd %d: transact failed: %s", sock, strerror(status));
+            ALOGW("fd %d: transact failed: %s", sock, strerror(err));
             goto send_err;
         }
 
@@ -94,18 +94,20 @@ void* handleConn(void* arg)
         if (send(sock, reply.data(), len, 0) < 0) {
             goto quit;
         }
+
+        continue;
+
+    send_err:
+        len = 0xffffffffffffffff;
+        n_len = htonl(len);
+        if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
+            goto quit;
+        }
+        if (send(sock, &err, sizeof(err), 0) < 0) {
+            goto quit;
+        }
     }
 
-send_err:
-    len = 0xffffffffffffffff;
-    n_len = htonl(len);
-    if (send(sock, &n_len, sizeof(n_len), 0) < 0) {
-        goto quit;
-    }
-    if (send(sock, &err, sizeof(err), 0) < 0) {
-        goto quit;
-    }
-    continue;
 quit:
     ALOGE("invalid send/recv: %s", strerror(errno));
     ALOGW("quitting handler fd: %d", sock);
