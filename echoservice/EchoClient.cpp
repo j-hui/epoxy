@@ -5,7 +5,12 @@
 
 #include <cstdio>
 #include <iostream>
+
 #include <chrono>
+#define DEF_TIMER(t) auto t = std::chrono::high_resolution_clock::now()
+#define GET_TIMER(t) std::chrono::duration<double, std::micro> \
+    (std::chrono::high_resolution_clock::now() - t).count()
+#define PRINT_TIMER(o, t) o << "TIME " #t ": " << GET_TIMER(t) << endl
 
 using namespace std;
 using namespace android;
@@ -30,9 +35,9 @@ int main(int argc, char **argv)
 
     sp<IServiceManager> sm = defaultServiceManager();
 
-    auto get_b = chrono::high_resolution_clock::now();
+    DEF_TIMER(get_service_time);
     sp<IBinder> binder = sm->getService(service);
-    auto get_e = chrono::high_resolution_clock::now();
+    PRINT_TIMER(cout, get_service_time);
 
     if (!binder) {
         cerr << "could not retrieve binder. exiting." << endl;
@@ -43,17 +48,17 @@ int main(int argc, char **argv)
 
     cerr << "Echoclient sending message: " << String8(msg).string() << endl;
 
-    auto call_b = chrono::high_resolution_clock::now();
+    DEF_TIMER(tx1_time);
     String16 reply = es->echo(msg);
-    auto call_e = chrono::high_resolution_clock::now();
+    PRINT_TIMER(cout, tx1_time);
 
-    cerr << "Echoclient received reply: " << String8(reply).c_str() << endl;
-
-    auto get_t = chrono::duration<double, micro>(get_e - get_b).count();
-    auto call_t = chrono::duration<double, micro>(call_e - call_b).count();
-
-    cout << "retrieving service: " << get_t << endl;
-    cout << "performing RPC call: " << call_t << endl;
+    cerr << "Echoclient received 1st reply: " << String8(reply).c_str() << endl;
+    cerr << "Echoclient sending 1st reply..." << endl;
+    
+    DEF_TIMER(tx2_time);
+    reply = es->echo(reply);
+    PRINT_TIMER(cout, tx2_time);
+    cerr << "Echoclient received 2nd reply: " << String8(reply).c_str() << endl;
 
     return 0;
 }
